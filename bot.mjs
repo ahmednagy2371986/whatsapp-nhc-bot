@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import dgram from 'dgram';
+import crypto from 'crypto';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 import { fileURLToPath } from 'url';
@@ -9,6 +10,7 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   Browsers,
+  generateMessageIDV2,
 } from '@whiskeysockets/baileys';
 import {
   AUTH_DIR,
@@ -105,11 +107,17 @@ async function syncClockOffset() {
   return 0;
 }
 
+function randomIntInclusive(min, max) {
+  const lo = Math.min(min, max);
+  const hi = Math.max(min, max);
+  return crypto.randomInt(lo, hi + 1);
+}
+
 /**
  * Computes today's date string (YYYY-MM-DD) and exact UTC epoch ms for
- * targetHour24:targetMinute:targetSecond.sendOffsetMs in UTC+timezoneOffsetHours.
+ * targetHour24:targetMinute:targetSecond + natural human reaction jitter.
  */
-function computeTargetTime(trueNowMs, cfg) {
+function computeTargetTime(trueNowMs, cfg, jitterMs = 0) {
   const tzOffsetMs = (cfg.timezoneOffsetHours ?? 3) * 3600 * 1000;
   const localShifted = new Date(trueNowMs + tzOffsetMs);
 
@@ -126,7 +134,7 @@ function computeTargetTime(trueNowMs, cfg) {
       cfg.targetHour24 ?? 13,
       cfg.targetMinute ?? 0,
       cfg.targetSecond ?? 0,
-      cfg.sendOffsetMs ?? 50
+      jitterMs
     ) - tzOffsetMs;
 
   return { dateStr, targetUtcMs };
@@ -191,6 +199,24 @@ function bareJid(jid) {
   return jid.replace(/:\d+@/, '@');
 }
 
+/**
+ * Sends plain text strictly as a natural human WhatsApp Web message:
+ * - Exact text only (zero extra prefixes/suffixes/link previews)
+ * - Official WhatsApp Web V2 message ID (3EB0...)
+ * - Clears typing state cleanly
+ */
+async function sendNaturalHumanText(sock, jid, exactText) {
+  const msgId = generateMessageIDV2(sock.user?.id);
+  try {
+    await sock.sendPresenceUpdate('paused', jid);
+  } catch (_) {}
+  return await sock.sendMessage(
+    jid,
+    { text: exactText },
+    { messageId: msgId }
+  );
+}
+
 async function run() {
   const args = new Set(process.argv.slice(2));
   const envMode = (process.env.BOT_MODE || '').trim().toLowerCase();
@@ -204,7 +230,6 @@ async function run() {
 
   const keyHex = getOrCreateKeyHex(isSetup);
 
-  // In non-setup modes, decrypt session.enc into auth_info if needed
   if (!isSetup) {
     if (fs.existsSync(ENC_FILE)) {
       const count = decryptAuthFolder(keyHex);
@@ -215,9 +240,9 @@ async function run() {
   }
 
   const offsetMs = await syncClockOffset();
-  const { dateStr } = computeTargetTime(Date.now() + offsetMs, config);
+  const jitterMs = randomIntInclusive(config.minJitterMs ?? 120, config.maxJitterMs ?? 380);
+  const { dateStr } = computeTargetTime(Date.now() + offsetMs, config, jitterMs);
 
-  // Deduplication safety: never double-send on the same day in LIVE mode
   if (modeName === 'LIVE' && config.lastSentDate === dateStr) {
     log(`Already sent "${config.messageText}" today (${dateStr}). Exiting cleanly without duplicate send.`);
     process.exit(0);
@@ -234,6 +259,9 @@ async function run() {
   async function persistAndExit(code = 0) {
     if (completed) return;
     completed = true;
+    try {
+      await activeSock?.sendPresenceUpdate('unavailable');
+    } catch (_) {}
     try {
       const n = encryptAuthFolder(keyHex);
       log(`Saved & encrypted ${n} updated session files -> session.enc`);
@@ -252,9 +280,10 @@ async function run() {
       auth: state,
       logger: pino({ level: 'silent' }),
       printQRInTerminal: false,
-      browser: Browsers.ubuntu('Chrome'),
+      browser: Browsers.windows('Desktop'),
       syncFullHistory: false,
       markOnlineOnConnect: false,
+      generateHighQualityLinkPreview: false,
     });
     activeSock = sock;
 
@@ -283,7 +312,6 @@ async function run() {
           log('ERROR: Device was logged out from WhatsApp. Re-run `npm run setup`.');
           process.exit(1);
         }
-        // Reconnect automatically (e.g., code 515 restartRequired right after QR scan)
         log('Reconnecting socket...');
         setTimeout(startSocket, 800);
       }
@@ -343,7 +371,7 @@ async function run() {
 
     if (isDryRun) {
       const nowTrue = Date.now() + offsetMs;
-      const { targetUtcMs } = computeTargetTime(nowTrue, config);
+      const { targetUtcMs } = computeTargetTime(nowTrue, config, jitterMs);
       log(
         `DRY-RUN OK! Local Time (UTC+${config.timezoneOffsetHours}): ${formatLocalClock(
           nowTrue,
@@ -357,17 +385,24 @@ async function run() {
 
     if (isTestMe) {
       const selfJid = bareJid(sock.user.id);
-      log(`Sending test message "${config.messageText}" to your own chat (${selfJid})...`);
-      await sock.sendMessage(selfJid, { text: `${config.messageText} (تجربة سحابية ناجحة ✅)` });
-      log('Self-test message delivered! Waiting 3s before saving session...');
+      log(`Sending exact message "${config.messageText}" (with zero additions) to your own chat (${selfJid})...`);
+      if (config.simulateHumanTyping !== false) {
+        try {
+          await sock.sendPresenceUpdate('available');
+          await sock.sendPresenceUpdate('composing', selfJid);
+          await new Promise((r) => setTimeout(r, randomIntInclusive(900, 1500)));
+        } catch (_) {}
+      }
+      await sendNaturalHumanText(sock, selfJid, config.messageText);
+      log('Exact message delivered cleanly! Waiting 3s before saving session...');
       await new Promise((r) => setTimeout(r, 3000));
       await persistAndExit(0);
       return;
     }
 
-    // LIVE MODE: Wait until exact 13:00:00.050 (UTC+3) and send "ناجى"
+    // LIVE MODE: Wait until 13:00:00 + natural jitter (UTC+3) and send strictly "ناجى"
     const nowTrue = Date.now() + offsetMs;
-    const { dateStr: todayStr, targetUtcMs } = computeTargetTime(nowTrue, config);
+    const { dateStr: todayStr, targetUtcMs } = computeTargetTime(nowTrue, config, jitterMs);
     const waitMs = targetUtcMs - nowTrue;
 
     if (waitMs < -5 * 60 * 1000) {
@@ -389,10 +424,19 @@ async function run() {
         )}...`
       );
       await waitUntilExact(targetUtcMs - 12000, offsetMs);
-      // Warm up connection & refresh group metadata 12s before 1:00 PM
       try {
         await activeSock.groupMetadata(config.groupId);
         log('Pre-1:00 PM socket & group metadata warm-up complete.');
+      } catch (_) {}
+    }
+
+    // Natural human presence & typing 3.2 seconds before 1:00 PM
+    const typingLeadMs = randomIntInclusive(2600, 3800);
+    if (config.simulateHumanTyping !== false && targetUtcMs - typingLeadMs > Date.now() + offsetMs) {
+      await waitUntilExact(targetUtcMs - typingLeadMs, offsetMs);
+      try {
+        await activeSock.sendPresenceUpdate('available');
+        await activeSock.sendPresenceUpdate('composing', config.groupId);
       } catch (_) {}
     }
 
@@ -401,7 +445,6 @@ async function run() {
       await waitUntilExact(targetUtcMs, offsetMs);
     }
 
-    // Send immediately at 13:00:00.050; if group is admin-locked, fire the instant it unlocks
     let sent = false;
     const deadline = Date.now() + (config.maxWaitUnlockMinutes || 5) * 60 * 1000;
 
@@ -409,10 +452,10 @@ async function run() {
       if (sent) return true;
       try {
         const fireTrue = Date.now() + offsetMs;
-        await activeSock.sendMessage(config.groupId, { text: config.messageText });
+        await sendNaturalHumanText(activeSock, config.groupId, config.messageText);
         sent = true;
         log(
-          `SUCCESS! Sent "${config.messageText}" to "${target.subject}" at exact time ${formatLocalClock(
+          `SUCCESS! Sent exact text "${config.messageText}" to "${target.subject}" at ${formatLocalClock(
             fireTrue,
             config.timezoneOffsetHours
           )}!`

@@ -6,7 +6,9 @@
   "targetHour24": 13,
   "targetMinute": 0,
   "targetSecond": 0,
-  "sendOffsetMs": 50,
+  "minJitterMs": 120,
+  "maxJitterMs": 380,
+  "simulateHumanTyping": true,
   "maxWaitUnlockMinutes": 5,
   "lastSentDate": ""
 }
