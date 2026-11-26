@@ -1,0 +1,20 @@
+{
+  "name": "whatsapp-nhc-cloud-bot",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Cloud WhatsApp Bot (Baileys + GitHub Actions) for ليالى NHC الكرويه every Sunday at 1:00 PM sharp",
+  "main": "bot.mjs",
+  "scripts": {
+    "setup": "node bot.mjs --setup",
+    "start": "node bot.mjs --live",
+    "dry-run": "node bot.mjs --dry-run",
+    "test-me": "node bot.mjs --test-me",
+    "encrypt": "node session-crypto.mjs encrypt",
+    "decrypt": "node session-crypto.mjs decrypt"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "pino": "^9.6.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
